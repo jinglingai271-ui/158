@@ -418,6 +418,9 @@ def handle_message(event):
     user_id = event.source.user_id
     msg_id = event.message.id
 
+    print(f"📩 [收到 LINE 訊息]: {user_msg}")
+
+    # 1. 車資試算指令
     if user_msg.startswith("試算") or user_msg.startswith("車資"):
         match = re.search(r'(?:試算|車資)\s*([\d\.]+)\s*([\d\.]+)', user_msg)
         if match:
@@ -431,6 +434,7 @@ def handle_message(event):
             line_bot_api.reply_message(event.reply_token, TextMessage(text=hint))
             return
 
+    # 2. 一鍵整單指令
     if user_msg in ["整單", "一鍵整單"]:
         flex_msg = FlexSendMessage(
             alt_text="一鍵整單助理",
@@ -477,6 +481,7 @@ def handle_message(event):
     has_dispatch_kw = any(kw in user_msg for kw in ["噴", "出", "待出發", "走", "好", "可", "ok", "OK"])
 
     with sheet_lock:
+        # A. 處理群組 tag 核銷
         if has_mention and has_dispatch_kw:
             mentioned_names = re.findall(r'@([^\s]+)', user_msg)
             for idx, row in enumerate(sheet_data[1:], start=2):
@@ -502,8 +507,8 @@ def handle_message(event):
         incoming_core = extract_core_address(user_msg)
 
         same_order_same_addr_idx = None
-        same_order_diff_addr_found = False
 
+        # B. 檢查是否與試算表中已有單據重複
         for idx, row in enumerate(sheet_data[1:], start=2):
             if not len(row) >= 1 or not row[0].strip():
                 continue
@@ -523,9 +528,8 @@ def handle_message(event):
                 elif incoming_core and existing_core and (incoming_core in existing_core or existing_core in incoming_core):
                     same_order_same_addr_idx = idx
                     break
-                else:
-                    same_order_diff_addr_found = True
 
+        # C. 已存在舊單：處理司機回報紀錄
         if same_order_same_addr_idx is not None:
             existing_c_cell = sheet_data[same_order_same_addr_idx - 1][2].strip()
 
@@ -538,10 +542,10 @@ def handle_message(event):
 
                 sheet_data[same_order_same_addr_idx - 1][2] = new_c_content
                 write_queue.put(("update_cell", (same_order_same_addr_idx, 3, new_c_content)))
-                return
-            else:
+                print(f"📝 [司機回報成功] 第 {same_order_same_addr_idx} 列更新")
                 return
 
+        # D. 不存在舊單：新增為新單據
         else:
             if is_new_order_format(user_msg):
                 booking_time = parse_booking_time(user_msg)
@@ -561,7 +565,10 @@ def handle_message(event):
                 
                 msg_id_to_row[msg_id] = target_row
                 write_queue.put(("append", new_row))
+                print(f"➕ [新單據新增隊列] 單號: {first_line} | 狀態: {new_status}")
                 return
+            else:
+                print(f"⚠️ [未符合新單據格式]: {first_line}")
 
 # ----------------------------------------------------
 # 🚀 Flask App 主實體 (相容主入口與外部匯入)
