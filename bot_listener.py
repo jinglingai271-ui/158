@@ -244,6 +244,7 @@ def chinese_to_num(text):
     return t
 
 def extract_order_code(text):
+    # 精準匹配 #S0/ 或 #S0 或 #A101，抓出斜線前的代碼
     match = re.search(r'#([a-zA-Z0-9]+)', text)
     if match:
         return match.group(1).upper()
@@ -251,16 +252,25 @@ def extract_order_code(text):
 
 def extract_core_address(text):
     t = text
-    t = re.sub(r'\[.*?\]', '', t)                          
-    t = re.sub(r'#[a-zA-Z0-9]+', '', t)                  
-    t = re.sub(r'\d{1,2}[:：點\.]\d{2}?', '', t)             
-    t = re.sub(r'(轉帳|改兩台|客下街口|\+\d+)', '', t)       
-    t = chinese_to_num(t)                                    
-    t = re.sub(r'[^\w\u4e00-\u9fa5]', '', t)                 
+    # 1. 移除括號內容
+    t = re.sub(r'\[.*?\]', '', t)
+    # 2. 徹底清掉 #S0/ 或 #S0 這種開頭前綴（包含斜線）
+    t = re.sub(r'#[a-zA-Z0-9]+/?', '', t)
+    # 3. 清除時間
+    t = re.sub(r'\d{1,2}[:：點\.]\d{2}?', '', t)
+    # 4. 清除雜詞
+    t = re.sub(r'(轉帳|改兩台|客下街口|\+\d+)', '', t)
+    # 5. 中文數字轉阿拉伯數字
+    t = chinese_to_num(t)
+    # 6. 只保留中英文與數字
+    t = re.sub(r'[^\w\u4e00-\u9fa5]', '', t)
     return t.strip()
 
 def is_new_order_format(text):
+    if not text:
+        return False
     first_line = text.split('\n')[0].strip()
+    # 只要開頭是 #、* 或包含 ┼ 均視為新單據格式
     if first_line.startswith("#") or first_line.startswith("*") or "┼" in first_line:
         return True
     return False
@@ -342,11 +352,14 @@ def handle_unsend(event):
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
     if intercept_event(event):
+        print("🛡️ [訊息被安全過濾器攔截]")
         return
 
     user_msg = event.message.text.strip()
     user_id = event.source.user_id
     msg_id = event.message.id
+
+    print(f"📩 [收到 LINE 訊息]: {repr(user_msg)}")
 
     if user_msg.startswith("試算") or user_msg.startswith("車資"):
         match = re.search(r'(?:試算|車資)\s*([\d\.]+)\s*([\d\.]+)', user_msg)
@@ -419,6 +432,8 @@ def handle_message(event):
         incoming_code = extract_order_code(first_line)
         incoming_core = extract_core_address(user_msg)
 
+        print(f"🔍 [解析單據] 單號代碼: {incoming_code} | 核心地址: {incoming_core}")
+
         same_order_same_addr_idx = None
         for idx, row in enumerate(sheet_data[1:], start=2):
             if not len(row) >= 1 or not row[0].strip():
@@ -451,6 +466,9 @@ def handle_message(event):
                 write_queue.put(("update_cell", (same_order_same_addr_idx, 3, new_c_content)))
                 print(f"📝 [司機回報排入佇列] 第 {same_order_same_addr_idx} 列更新")
                 return
+            else:
+                print(f"ℹ️ [比對到相同單號/地址，但非司機回報格式，跳過]: 列 {same_order_same_addr_idx}")
+                return
 
         # C. 新增單據
         else:
@@ -468,13 +486,12 @@ def handle_message(event):
                     new_type
                 ]
                 
-                # ⚡ 瞬間寫入記憶體快取並推入背景佇列，零等待！
                 sheet_data.append(new_row)
                 target_row = len(sheet_data)
                 msg_id_to_row[msg_id] = target_row
                 write_queue.put(("append", new_row))
                 
-                print(f"⚡ [高速排入佇列] 新單號: {first_line} | 狀態: {new_status}")
+                print(f"⚡ [成功排入佇列] 新單號: {first_line} | 狀態: {new_status}")
                 return
             else:
                 print(f"⚠️ [未符合新單據格式]: {first_line}")
