@@ -156,9 +156,13 @@ def check_reservation_orders():
 
 def init_bot_listener():
     init_sheet_data()
-    scheduler = BackgroundScheduler()
-    scheduler.add_job(func=check_reservation_orders, trigger="interval", seconds=60)
-    scheduler.start()
+    try:
+        scheduler = BackgroundScheduler()
+        scheduler.add_job(func=check_reservation_orders, trigger="interval", seconds=60)
+        scheduler.start()
+        print("⏰ [排程器啟動成功]")
+    except Exception as e:
+        print(f"⚠️ 排程器啟動警告: {e}")
 
 def calculate_fare(km, mins):
     base_fare = 80
@@ -251,15 +255,23 @@ def intercept_event(event):
 def callback():
     signature = request.headers.get('X-Line-Signature')
     body = request.get_data(as_text=True)
+    
+    print("📡 [收到 HTTP POST /callback 請求]")
+
     if not signature:
+        print("⚠️ 缺少 X-Line-Signature 標頭")
         return 'OK', 200
+
     try:
         handler.handle(body, signature)
     except InvalidSignatureError:
+        print("⚠️ [LINE 簽名驗證跳過/測試請求]")
         return 'OK', 200
     except Exception as e:
-        print(f"❌ Callback 異常: {e}")
+        print(f"❌ Callback 處理異常: {e}")
+        traceback.print_exc()
         return 'OK', 200
+        
     return 'OK', 200
 
 @bot_bp.route('/api/get_unassigned', methods=['GET'])
@@ -312,7 +324,7 @@ def handle_message(event):
     user_id = event.source.user_id
     msg_id = event.message.id
 
-    print(f"📩 [收到 LINE 訊息]: {user_msg}")
+    print(f"📩 [進入 handle_message 處理器]: {user_msg}")
 
     if user_msg.startswith("試算") or user_msg.startswith("車資"):
         match = re.search(r'(?:試算|車資)\s*([\d\.]+)\s*([\d\.]+)', user_msg)
@@ -424,7 +436,7 @@ def handle_message(event):
         else:
             if is_new_order_format(user_msg):
                 booking_time = parse_booking_time(user_msg)
-                new_status = "預約等待中" if booking_time else "未派出"
+                new_status = "預預約等待中" if booking_time else "未派出"
                 new_type = "預約單" if booking_time else "即時"
 
                 new_row = [
@@ -436,7 +448,6 @@ def handle_message(event):
                     new_type
                 ]
                 
-                # 直接寫入 Google Sheet
                 sheet.append_row(new_row)
                 sheet_data.append(new_row)
                 target_row = len(sheet_data)
@@ -461,6 +472,7 @@ app.register_blueprint(bot_bp)
 def index():
     return "Bot Listener is running!", 200
 
+# 啟動時自動載入快取與排程器
 init_bot_listener()
 
 if __name__ == "__main__":
