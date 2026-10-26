@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NPC整單助理</title>
+    <!-- 引入 LINE LIFF SDK -->
+    <script src="https://static.line-scdn.net/liff/edge/2/sdk.js"></script>
+    <style>
+        body { 
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; 
+            text-align: center; 
+            padding: 20px 15px; 
+            background: #121212; 
+            color: #fff; 
+        }
+        .card { 
+            background: #1e1e1e; 
+            border-radius: 16px; 
+            padding: 25px 20px; 
+            box-shadow: 0 8px 20px rgba(0,0,0,0.4); 
+            max-width: 400px; 
+            margin: 0 auto; 
+        }
+        .title { 
+            font-size: 20px; 
+            font-weight: bold; 
+            margin-bottom: 10px; 
+            color: #ffffff; 
+        }
+        .status { 
+            color: #1DB446; 
+            font-size: 14px; 
+            font-weight: 600; 
+            margin-bottom: 20px; 
+            line-height: 1.5;
+        }
+        .btn-list {
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+        }
+        .btn { 
+            background: #1DB446; 
+            color: #fff; 
+            border: none; 
+            padding: 14px 20px; 
+            font-size: 16px; 
+            font-weight: bold; 
+            border-radius: 10px; 
+            width: 100%; 
+            cursor: pointer; 
+            transition: all 0.2s ease;
+            box-shadow: 0 4px 10px rgba(29, 180, 70, 0.3);
+        }
+        .btn:active {
+            transform: scale(0.98);
+        }
+        .btn:disabled { 
+            background: #333333; 
+            color: #777777; 
+            box-shadow: none;
+            cursor: not-allowed; 
+        }
+        .sub-text { 
+            font-size: 12px; 
+            color: #888888; 
+            margin-top: 20px; 
+        }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <div class="title">NPC 整單助理</div>
+        <p class="status" id="status">正在取得未派單據...</p>
+        <div class="btn-list" id="btn-container"></div>
+        <div class="sub-text">請依序點擊按鈕，即可用您的個人帳號發送獨立訊息</div>
+    </div>
+
+    <script>
+        // ⚠️ 請替換為你的 LIFF ID
+        const MY_LIFF_ID = "2011777708-58qvPNLe"; 
+        let allOrders = [];
+        let sentCount = 0;
+        let totalPages = 0;
+
+        async function main() {
+            try {
+                await liff.init({ liffId: MY_LIFF_ID });
+
+                if (!liff.isLoggedIn()) {
+                    liff.login();
+                    return;
+                }
+
+                // 呼叫後端 API 取得未派出的單據
+                const res = await fetch('/api/get_unassigned');
+                const data = await res.json();
+                allOrders = data.orders || [];
+
+                if (allOrders.length === 0) {
+                    document.getElementById('status').innerText = "目前沒有未派出的單據！";
+                    setTimeout(() => liff.closeWindow(), 2000);
+                    return;
+                }
+
+                document.getElementById('status').innerText = `共有 ${allOrders.length} 筆未派單據\n請依序點擊按鈕進行發送：`;
+                renderButtons();
+
+            } catch (err) {
+                console.error("LIFF 初始化失敗:", err);
+                document.getElementById('status').innerText = "載入失敗，請確認網路連線或 LIFF 設定";
+            }
+        }
+
+        function renderButtons() {
+            const container = document.getElementById('btn-container');
+            container.innerHTML = "";
+            const chunkSize = 5; // 每批次上限 5 條 (符合 LINE sendMessages 限制)
+            totalPages = Math.ceil(allOrders.length / chunkSize);
+
+            for (let i = 0; i < allOrders.length; i += chunkSize) {
+                const pageIndex = Math.floor(i / chunkSize) + 1;
+                const chunk = allOrders.slice(i, i + chunkSize);
+                const endNum = Math.min(i + chunkSize, allOrders.length);
+
+                const btn = document.createElement('button');
+                btn.className = 'btn';
+                btn.id = `btn-${pageIndex}`;
+                btn.innerText = `發送第 ${i + 1} ~ ${endNum} 筆（${chunk.length} 氣泡）`;
+                
+                btn.onclick = async () => {
+                    btn.disabled = true;
+                    btn.innerText = `發送中...`;
+                    
+                    // 將單據轉化成獨立的文字訊息物件
+                    const messages = chunk.map(order => ({
+                        type: 'text',
+                        text: order.trim()
+                    }));
+
+                    try {
+                        // 以使用者個人身分發送訊息
+                        await liff.sendMessages(messages);
+                        
+                        btn.innerText = `已發送第 ${i + 1} ~ ${endNum} 筆 ✓`;
+                        sentCount++;
+
+                        // 如果全部組別都已發送完畢，提示並關閉視窗
+                        if (sentCount === totalPages) {
+                            document.getElementById('status').innerText = "🎉 所有單據已全部發送完畢！";
+                            setTimeout(() => liff.closeWindow(), 1200);
+                        }
+                    } catch (err) {
+                        alert("發送失敗: " + (err.message || "請重試"));
+                        btn.disabled = false;
+                        btn.innerText = `發送第 ${i + 1} ~ ${endNum} 筆（${chunk.length} 氣泡）`;
+                    }
+                };
+
+                container.appendChild(btn);
+            }
+        }
+
+        main();
+    </script>
+</body>
+</html>
