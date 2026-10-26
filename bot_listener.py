@@ -291,7 +291,8 @@ def chinese_to_num(text):
     return t
 
 def extract_order_code(text):
-    match = re.search(r'#([a-zA-Z0-9/]+)', text)
+    # 只擷取 # 後面的英數字（遇到 / 或空白就停止），例如 #S0/地址 會精準抓出 "S0"
+    match = re.search(r'#([a-zA-Z0-9]+)', text)
     if match:
         return match.group(1).upper()
     return None
@@ -299,7 +300,7 @@ def extract_order_code(text):
 def extract_core_address(text):
     t = text
     t = re.sub(r'\[.*?\]', '', t)                          
-    t = re.sub(r'#[a-zA-Z0-9/／]+', '', t)                 
+    t = re.sub(r'#[a-zA-Z0-9]+', '', t)                  # 只消除 #與單號本身，保留後續地址
     t = re.sub(r'\d{1,2}[:：點\.]\d{2}?', '', t)             
     t = re.sub(r'(轉帳|改兩台|客下街口|\+\d+)', '', t)       
     t = chinese_to_num(t)                                    
@@ -348,10 +349,11 @@ def callback():
         return 'OK', 200
 
     try:
+        # 正常嘗試用 LINE SDK 處理訊息與簽名驗證
         handler.handle(body, signature)
     except InvalidSignatureError:
-        # 為了讓 LINE 後台的 Verify 按鈕順利通過，這裡即使簽名不符也回傳 200 OK
-        print("🛡️ [LINE 驗證/測試請求] 簽名驗證略過，回傳 200 OK")
+        # 如果是 LINE Developers 控制台的 Verify 按鈕點擊測試，允許通過
+        print("🗣️ [LINE 驗證/測試請求] 簽名驗證略過，回傳 200 OK")
         return 'OK', 200
     except Exception as e:
         print(f"❌ Callback 處理異常: {e}")
