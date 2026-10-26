@@ -116,7 +116,7 @@ def init_sheet_data():
         print("❌ 初始化 Google Sheet 失敗:", str(e))
 
 def background_writer():
-    """ 背景執行緒：依序安全寫入 Google Sheet，絕不卡住主線程 """
+    """ 背景執行緒：依序安全寫入 Google Sheet，並印出詳細錯誤 """
     print("🚀 [背景寫入執行緒] 已啟動運行")
     while True:
         try:
@@ -125,20 +125,23 @@ def background_writer():
                 break
             
             action, payload = task
+            print(f"☁️ [背景準備寫入] 動作: {action} | 內容: {str(payload)[:30]}...")
+            
             sheet = get_sheet()
             
             if action == "append":
                 sheet.append_row(payload)
-                print(f"☁️ [背景寫入成功] 新增單號: {payload[0][:20]}...")
+                print(f"☁️ [背景寫入成功] 新增單號完成！")
             elif action == "update_cell":
                 row, col, value = payload
                 sheet.update_cell(row, col, value)
-                print(f"☁️ [背景寫入成功] 第 {row} 列 Col {col} -> {value}")
+                print(f"☁️ [背景寫入成功] 第 {row} 列 Col {col} 更新完成！")
             
             write_queue.task_done()
-            time.sleep(1.0) # 控速保護，避免觸發 Google API 429 頻率限制
+            time.sleep(1.0) # 控速保護
         except Exception as e:
-            print(f"❌ [背景寫入異常]: {e}")
+            print(f"❌ [背景寫入發生重大異常]: {e}")
+            traceback.print_exc() # 印出完整錯誤堆疊，方便抓蟲
             time.sleep(2.0)
 
 def parse_booking_time(text):
