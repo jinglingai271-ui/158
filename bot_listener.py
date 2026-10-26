@@ -3,9 +3,6 @@ import os
 import re
 import math
 import traceback
-import threading
-import queue
-import time
 import json
 import base64
 from datetime import datetime, timedelta
@@ -22,7 +19,6 @@ import gspread
 from google.oauth2.service_account import Credentials
 from apscheduler.schedulers.background import BackgroundScheduler
 
-# 建立 Blueprint 供內部或外部掛載
 bot_bp = Blueprint('bot_listener', __name__)
 
 # ==================== 設定區 ====================
@@ -31,17 +27,11 @@ LINE_CHANNEL_SECRET = os.environ.get('LINE_CHANNEL_SECRET', 'a3defb6dbcd3d0743cd
 SHEET_NAME = "調度室派單管理表"
 LIFF_ID = "2011777708-58qvPNLe"
 
-# 🟢 攔截設定：使用者黑名單
-BLOCKED_USER_IDS = set([
-    # "U1234567890abcdef...", 
-])
-
-# 🟢 攔截設定：文字訊息關鍵字黑名單/過濾詞
+BLOCKED_USER_IDS = set([])
 BLOCKED_KEYWORDS = ["測試灌水", "廣告文字"]
 # ================================================
 
 scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
-
 google_creds_raw = os.environ.get("GOOGLE_CREDENTIALS")
 
 creds = None
@@ -50,8 +40,6 @@ gs_client = None
 if google_creds_raw and google_creds_raw.strip():
     raw_str = google_creds_raw.strip()
     creds_info = None
-
-    # 1. 嘗試 Base64 解碼
     try:
         missing_padding = len(raw_str) % 4
         if missing_padding:
@@ -63,7 +51,6 @@ if google_creds_raw and google_creds_raw.strip():
     except Exception:
         pass
 
-    # 2. 若非 Base64，嘗試直接當作 JSON 解析
     if not creds_info:
         try:
             creds_info = json.loads(raw_str)
@@ -71,14 +58,12 @@ if google_creds_raw and google_creds_raw.strip():
         except Exception as e:
             print(f"❌ 解析失敗: {e}")
 
-    # 3. 建構 Credentials 物件
     if creds_info:
         try:
             creds = Credentials.from_service_account_info(creds_info, scopes=scopes)
         except Exception as e:
             print(f"❌ 從憑證資訊建構 Credentials 失敗: {e}")
 
-# 若環境變數處理失敗，備用讀取本地檔案
 if not creds:
     if os.path.exists("credentials.json"):
         try:
@@ -86,8 +71,6 @@ if not creds:
             print("✅ 成功讀取本地 credentials.json 檔案")
         except Exception as e:
             print(f"❌ 讀取本地 credentials.json 失敗: {e}")
-    else:
-        print("❌ 未設定有效 GOOGLE_CREDENTIALS，且無本地 credentials.json！")
 
 if creds:
     try:
@@ -99,14 +82,7 @@ if creds:
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
-# ----------------------------------------------------
-# ⚡ 記憶體快取與非同步寫入隊列
-# ----------------------------------------------------
-sheet_data = []             # 全域記憶體快取
-write_queue = queue.Queue() # Google Sheet 背景寫入隊列
-sheet_lock = threading.Lock()
-
-# 快取：用來紀錄 message_id 與 Google Sheet 列號的對照關聯
+sheet_data = [] 
 msg_id_to_row = {}
 
 def get_sheet():
@@ -116,7 +92,7 @@ def get_sheet():
     return gs_client.open(SHEET_NAME).sheet1
 
 def init_sheet_data():
-    """ 啟動時或手動重置時，完整同步 Google Sheet 至記憶體 """
+    """ 啟動時完整同步 Google Sheet 至記憶體 """
     global sheet_data
     if not gs_client:
         print("⚠️ 無法載入 Google Sheet：gs_client 未初始化！")
@@ -124,56 +100,18 @@ def init_sheet_data():
     try:
         sheet = get_sheet()
         raw_data = sheet.get_all_values()
-        
-        # 確保每列欄位長度至少達到 6 欄 (A~F)
         formatted_data = []
         for row in raw_data:
             row_copy = list(row)
             while len(row_copy) < 6:
                 row_copy.append("")
             formatted_data.append(row_copy)
-
-        with sheet_lock:
-            sheet_data = formatted_data
+        sheet_data = formatted_data
         print(f"⚡ [系統初始化] 成功載入 {len(sheet_data)} 列資料至記憶體！")
     except Exception as e:
         print("❌ 初始化 Google Sheet 失敗:", str(e))
 
-def background_writer():
-    """ 背景執行緒：依序寫回 Google Sheet，防護 API 429 配額爆量 """
-    while True:
-        task = write_queue.get()
-        if task is None:
-            break
-        
-        action, payload = task
-        retry_count = 0
-        success = False
-
-        while retry_count < 3 and not success:
-            try:
-                sheet = get_sheet()
-                if action == "append":
-                    sheet.append_row(payload)
-                    print(f"☁️ [背景寫入成功] 新增單號: {payload[0]}")
-                elif action == "update_cell":
-                    row, col, value = payload
-                    sheet.update_cell(row, col, value)
-                    print(f"☁️ [背景寫入成功] 第 {row} 列 Col {col} -> {value}")
-                success = True
-                time.sleep(1.2) # 嚴格控速保護
-            except Exception as e:
-                retry_count += 1
-                print(f"❌ [背景寫入異常 (嘗試 {retry_count}/3)]: {str(e)}")
-                time.sleep(2.0)
-                
-        write_queue.task_done()
-
-# ----------------------------------------------------
-# ⏰ 預約單解析與自動排程檢查
-# ----------------------------------------------------
 def parse_booking_time(text):
-    """ 從單號中解析時間 """
     now = datetime.now()
     match = re.search(r'(\d{1,2})[:：點\.](\d{2})?', text)
     if match:
@@ -187,60 +125,50 @@ def parse_booking_time(text):
     return None
 
 def check_reservation_orders():
-    """ 每 60 秒定期輪詢預約單時間狀況 """
+    """ 定期輪詢預約單時間狀況並直接同步 Google Sheet """
     now = datetime.now()
-    with sheet_lock:
+    try:
+        sheet = get_sheet()
         for idx in range(1, len(sheet_data)):
             row = sheet_data[idx]
-            sheet_row_num = idx + 1  # 實際 Sheet 中的列號 (1-based)
-            
+            sheet_row_num = idx + 1 
             if len(row) >= 6 and row[5] == "預約單" and row[1] in ["未派出", "預約等待中"]:
                 booking_time_str = row[4]
                 if not booking_time_str:
                     continue
-                try:
-                    booking_dt = datetime.strptime(booking_time_str, "%Y-%m-%d %H:%M")
-                    time_diff_minutes = (booking_dt - now).total_seconds() / 60.0
+                booking_dt = datetime.strptime(booking_time_str, "%Y-%m-%d %H:%M")
+                time_diff_minutes = (booking_dt - now).total_seconds() / 60.0
 
-                    if time_diff_minutes <= 15:
-                        if sheet_data[idx][1] != "未派出" or sheet_data[idx][5] != "即時":
-                            sheet_data[idx][1] = "未派出"
-                            sheet_data[idx][5] = "即時"
-                            write_queue.put(("update_cell", (sheet_row_num, 2, "未派出")))
-                            write_queue.put(("update_cell", (sheet_row_num, 6, "即時")))
-                            print(f"⏰ [預約單轉即時] 第 {sheet_row_num} 列升級為即時單")
-                    elif time_diff_minutes <= 60:
-                        if sheet_data[idx][1] != "未派出":
-                            sheet_data[idx][1] = "未派出"
-                            write_queue.put(("update_cell", (sheet_row_num, 2, "未派出")))
-                            print(f"⏰ [預約單開放整單] 第 {sheet_row_num} 列進入整單流程")
-                except Exception:
-                    pass
+                if time_diff_minutes <= 15:
+                    if sheet_data[idx][1] != "未派出" or sheet_data[idx][5] != "即時":
+                        sheet_data[idx][1] = "未派出"
+                        sheet_data[idx][5] = "即時"
+                        sheet.update_cell(sheet_row_num, 2, "未派出")
+                        sheet.update_cell(sheet_row_num, 6, "即時")
+                        print(f"⏰ [預約單轉即時] 第 {sheet_row_num} 列升級為即時單")
+                elif time_diff_minutes <= 60:
+                    if sheet_data[idx][1] != "未派出":
+                        sheet_data[idx][1] = "未派出"
+                        sheet.update_cell(sheet_row_num, 2, "未派出")
+                        print(f"⏰ [預約單開放整單] 第 {sheet_row_num} 列進入整單流程")
+    except Exception as e:
+        print(f"❌ 輪詢預約單異常: {e}")
 
 def init_bot_listener():
-    """ 由外部或內部呼叫進行背景任務與快取初始化 """
-    threading.Thread(target=background_writer, daemon=True).start()
     init_sheet_data()
-    
     scheduler = BackgroundScheduler()
     scheduler.add_job(func=check_reservation_orders, trigger="interval", seconds=60)
     scheduler.start()
 
-# ----------------------------------------------------
-# 🧮 車資試算邏輯
-# ----------------------------------------------------
 def calculate_fare(km, mins):
     base_fare = 80
     time_fare = mins * 3
-    
     if km <= 20:
         dist_fare = km * 15
     else:
         dist_fare = (20 * 15) + ((km - 20) * (15 + 10))
-        
     total_fare = math.ceil(base_fare + dist_fare + time_fare)
-    
-    breakdown = (
+    return (
         f"🚖 【車資試算結果】\n"
         f"-------------------\n"
         f"📍 里程：{km:.1f} 公里\n"
@@ -252,27 +180,19 @@ def calculate_fare(km, mins):
         f"-------------------\n"
         f"💰 預估總車資：${total_fare} 元"
     )
-    return breakdown
 
-# ----------------------------------------------------
-# 🔍 司機回報格式審查（支援 3 行或 4 行）
-# ----------------------------------------------------
 def is_valid_driver_report(text):
     lines = [line.strip() for line in text.strip().split('\n') if line.strip()]
     if len(lines) not in [3, 4]:
         return False
-
     line_first = lines[0]
     line_car = lines[-2]
     line_time = lines[-1]
-
     if not line_first.startswith("#"):
         return False
-
     color_keywords = ["白", "黑", "銀", "灰", "紅", "藍", "黃", "綠", "金", "紫", "棕"]
     has_car_info = re.search(r'\d+', line_car) and any(c in line_car for c in color_keywords)
     has_time_info = bool(re.search(r'\d+', line_time))
-
     return (has_car_info and has_time_info)
 
 def chinese_to_num(text):
@@ -283,7 +203,6 @@ def chinese_to_num(text):
         v1 = cn_num.get(p1, 1) if p1 else 1
         v2 = cn_num.get(p2, 0) if p2 else 0
         return str(v1 * 10 + v2)
-    
     t = re.sub(r'([一二三四五六七八九])?十([一二三四五六七八九])?', repl_ten, text)
     for k, v in cn_num.items():
         if k != '十':
@@ -291,7 +210,6 @@ def chinese_to_num(text):
     return t
 
 def extract_order_code(text):
-    # 只擷取 # 後面的英數字（遇到 / 或空白就停止），例如 #S0/地址 會精準抓出 "S0"
     match = re.search(r'#([a-zA-Z0-9]+)', text)
     if match:
         return match.group(1).upper()
@@ -300,7 +218,7 @@ def extract_order_code(text):
 def extract_core_address(text):
     t = text
     t = re.sub(r'\[.*?\]', '', t)                          
-    t = re.sub(r'#[a-zA-Z0-9]+', '', t)                  # 只消除 #與單號本身，保留後續地址
+    t = re.sub(r'#[a-zA-Z0-9]+', '', t)                  
     t = re.sub(r'\d{1,2}[:：點\.]\d{2}?', '', t)             
     t = re.sub(r'(轉帳|改兩台|客下街口|\+\d+)', '', t)       
     t = chinese_to_num(t)                                    
@@ -313,101 +231,77 @@ def is_new_order_format(text):
         return True
     return False
 
-# ----------------------------------------------------
-# 🛑 訊息與事件攔截過濾器
-# ----------------------------------------------------
 def intercept_event(event):
     user_id = getattr(event.source, 'user_id', None)
-
     if user_id and user_id in BLOCKED_USER_IDS:
-        print(f"🛡️ [攔截成功] 來自黑名單使用者 {user_id} 的事件，自動忽略。")
         return True
-
     if isinstance(event, MessageEvent) and isinstance(event.message, TextMessage):
         text = event.message.text.strip()
         if len(text) > 1000:
-            print(f"🛡️ [攔截成功] 訊息過長 ({len(text)} 字)，疑為灌水攻擊，自動忽略。")
             return True
-
         for kw in BLOCKED_KEYWORDS:
             if kw in text:
-                print(f"🛡️ [攔截成功] 訊息包含禁用關鍵字 '{kw}'，自動忽略。")
                 return True
-
     return False
 
 # ----------------------------------------------------
-# 📌 Blueprint 路由（Webhook 及 LIFF/API 路由）
+# 📌 路由
 # ----------------------------------------------------
 @bot_bp.route("/callback", methods=['POST'])
 def callback():
     signature = request.headers.get('X-Line-Signature')
     body = request.get_data(as_text=True)
-
     if not signature:
-        print("🛡️ [攔截成功] 缺少 X-Line-Signature 請求頭")
         return 'OK', 200
-
     try:
-        # 正常嘗試用 LINE SDK 處理訊息與簽名驗證
         handler.handle(body, signature)
     except InvalidSignatureError:
-        # 如果是 LINE Developers 控制台的 Verify 按鈕點擊測試，允許通過
-        print("🗣️ [LINE 驗證/測試請求] 簽名驗證略過，回傳 200 OK")
         return 'OK', 200
     except Exception as e:
-        print(f"❌ Callback 處理異常: {e}")
-        traceback.print_exc()
+        print(f"❌ Callback 異常: {e}")
         return 'OK', 200
-
     return 'OK', 200
 
 @bot_bp.route('/api/get_unassigned', methods=['GET'])
 def api_get_unassigned():
-    """ LIFF 一鍵整單取得未派出單據 API """
     unassigned_orders = []
     now = datetime.now()
     cutoff_time = now - timedelta(minutes=10)
-
-    with sheet_lock:
-        for row in sheet_data[1:]:
-            if len(row) >= 2 and row[1] == "未派出":
-                order_time_str = row[4] if len(row) >= 5 else ""
-                
-                if order_time_str:
-                    try:
-                        order_dt = datetime.strptime(order_time_str, "%Y-%m-%d %H:%M")
-                        if cutoff_time <= order_dt <= now:
-                            unassigned_orders.append(row[0].strip())
-                    except Exception:
+    for row in sheet_data[1:]:
+        if len(row) >= 2 and row[1] == "未派出":
+            order_time_str = row[4] if len(row) >= 5 else ""
+            if order_time_str:
+                try:
+                    order_dt = datetime.strptime(order_time_str, "%Y-%m-%d %H:%M")
+                    if cutoff_time <= order_dt <= now:
                         unassigned_orders.append(row[0].strip())
-                else:
+                except Exception:
                     unassigned_orders.append(row[0].strip())
-
+            else:
+                unassigned_orders.append(row[0].strip())
     return jsonify({"orders": unassigned_orders})
 
 @bot_bp.route('/liff', methods=['GET'])
 def liff_page():
-    """ 渲染 LIFF 頁面 """
     return render_template('liff.html')
 
 # ----------------------------------------------------
-# 🟢 事件監聽 handlers
+# 🟢 事件監聽
 # ----------------------------------------------------
 @handler.add(UnsendEvent)
 def handle_unsend(event):
     if intercept_event(event):
         return
-
     unsend_msg_id = event.unsend.message_id
-    print(f"🗑️ 收到訊息收回事件 (message_id: {unsend_msg_id})")
-
-    with sheet_lock:
-        target_row_idx = msg_id_to_row.get(unsend_msg_id)
-        if target_row_idx and target_row_idx <= len(sheet_data):
-            sheet_data[target_row_idx - 1][1] = "取消"
-            write_queue.put(("update_cell", (target_row_idx, 2, "取消")))
-            print(f"🚫 [收回取消成功] 第 {target_row_idx} 列單據狀態已更新為：取消")
+    target_row_idx = msg_id_to_row.get(unsend_msg_id)
+    if target_row_idx and target_row_idx <= len(sheet_data):
+        sheet_data[target_row_idx - 1][1] = "取消"
+        try:
+            sheet = get_sheet()
+            sheet.update_cell(target_row_idx, 2, "取消")
+            print(f"🚫 [收回取消成功] 第 {target_row_idx} 列已更新為：取消")
+        except Exception as e:
+            print(f"❌ 更新取消狀態失敗: {e}")
 
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
@@ -420,7 +314,6 @@ def handle_message(event):
 
     print(f"📩 [收到 LINE 訊息]: {user_msg}")
 
-    # 1. 車資試算指令
     if user_msg.startswith("試算") or user_msg.startswith("車資"):
         match = re.search(r'(?:試算|車資)\s*([\d\.]+)\s*([\d\.]+)', user_msg)
         if match:
@@ -430,11 +323,9 @@ def handle_message(event):
             line_bot_api.reply_message(event.reply_token, TextMessage(text=fare_result))
             return
         else:
-            hint = "⚠️ 試算格式不正確！\n請輸入：`試算 [公里數] [分鐘數]`\n例如：`試算 25 30`"
-            line_bot_api.reply_message(event.reply_token, TextMessage(text=hint))
+            line_bot_api.reply_message(event.reply_token, TextMessage(text="⚠️ 試算格式不正確！請輸入：`試算 25 30`"))
             return
 
-    # 2. 一鍵整單指令
     if user_msg in ["整單", "一鍵整單"]:
         flex_msg = FlexSendMessage(
             alt_text="一鍵整單助理",
@@ -445,19 +336,8 @@ def handle_message(event):
                     padding_all='10px',
                     spacing='sm',
                     contents=[
-                        TextComponent(
-                            text="158派單助理", 
-                            weight="bold", 
-                            size="xs", 
-                            color="#aaaaaa",
-                            align="center"
-                        ),
-                        ButtonComponent(
-                            style='primary',
-                            color='#1DB446',
-                            height='sm',
-                            action=URIAction(label='一鍵整單', uri=f'https://liff.line.me/{LIFF_ID}')
-                        )
+                        TextComponent(text="158派單助理", weight="bold", size="xs", color="#aaaaaa", align="center"),
+                        ButtonComponent(style='primary', color='#1DB446', height='sm', action=URIAction(label='一鍵整單', uri=f'https://liff.line.me/{LIFF_ID}'))
                     ]
                 )
             )
@@ -480,8 +360,10 @@ def handle_message(event):
     has_mention = "@" in user_msg
     has_dispatch_kw = any(kw in user_msg for kw in ["噴", "出", "待出發", "走", "好", "可", "ok", "OK"])
 
-    with sheet_lock:
-        # A. 處理群組 tag 核銷
+    try:
+        sheet = get_sheet()
+
+        # A. 群組 tag 核銷
         if has_mention and has_dispatch_kw:
             mentioned_names = re.findall(r'@([^\s]+)', user_msg)
             for idx, row in enumerate(sheet_data[1:], start=2):
@@ -493,13 +375,12 @@ def handle_message(event):
                         if clean_m_name and (f"[{clean_m_name}]" in c_cell_text or clean_m_name in c_cell_text):
                             matched = True
                             break
-                    
                     if matched:
                         sheet_data[idx - 1][1] = "已派出"
                         sheet_data[idx - 1][3] = f"核銷調度:{sender_name}"
-                        write_queue.put(("update_cell", (idx, 2, "已派出")))
-                        write_queue.put(("update_cell", (idx, 4, f"核銷調度:{sender_name}")))
-                        print(f"🚀 [調度核銷成功] 第 {idx} 列 -> B欄:已派出 | D欄:核銷調度:{sender_name}")
+                        sheet.update_cell(idx, 2, "已派出")
+                        sheet.update_cell(idx, 4, f"核銷調度:{sender_name}")
+                        print(f"🚀 [調度核銷成功] 第 {idx} 列 -> 已派出")
                         return
 
         first_line = user_msg.split('\n')[0].strip()
@@ -507,12 +388,9 @@ def handle_message(event):
         incoming_core = extract_core_address(user_msg)
 
         same_order_same_addr_idx = None
-
-        # B. 檢查是否與試算表中已有單據重複
         for idx, row in enumerate(sheet_data[1:], start=2):
             if not len(row) >= 1 or not row[0].strip():
                 continue
-
             existing_raw = row[0].strip()
             existing_code = extract_order_code(existing_raw)
             existing_core = extract_core_address(existing_raw)
@@ -520,7 +398,6 @@ def handle_message(event):
             if user_msg == existing_raw or first_line == existing_raw:
                 same_order_same_addr_idx = idx
                 break
-
             if incoming_code and existing_code and incoming_code == existing_code:
                 if not incoming_core and not existing_core:
                     same_order_same_addr_idx = idx
@@ -529,23 +406,21 @@ def handle_message(event):
                     same_order_same_addr_idx = idx
                     break
 
-        # C. 已存在舊單：處理司機回報紀錄
+        # B. 司機回報
         if same_order_same_addr_idx is not None:
             existing_c_cell = sheet_data[same_order_same_addr_idx - 1][2].strip()
-
             if is_valid_driver_report(user_msg):
                 formatted_report = f"[{sender_name}]\n{user_msg}"
                 if existing_c_cell:
                     new_c_content = f"{existing_c_cell}\n\n--------------------\n{formatted_report}"
                 else:
                     new_c_content = formatted_report
-
                 sheet_data[same_order_same_addr_idx - 1][2] = new_c_content
-                write_queue.put(("update_cell", (same_order_same_addr_idx, 3, new_c_content)))
+                sheet.update_cell(same_order_same_addr_idx, 3, new_c_content)
                 print(f"📝 [司機回報成功] 第 {same_order_same_addr_idx} 列更新")
                 return
 
-        # D. 不存在舊單：新增為新單據
+        # C. 新增單據
         else:
             if is_new_order_format(user_msg):
                 booking_time = parse_booking_time(user_msg)
@@ -560,18 +435,24 @@ def handle_message(event):
                     booking_time if booking_time else "", 
                     new_type
                 ]
+                
+                # 直接寫入 Google Sheet
+                sheet.append_row(new_row)
                 sheet_data.append(new_row)
                 target_row = len(sheet_data)
-                
                 msg_id_to_row[msg_id] = target_row
-                write_queue.put(("append", new_row))
-                print(f"➕ [新單據新增隊列] 單號: {first_line} | 狀態: {new_status}")
+                
+                print(f"🎉 [Google Sheet 寫入成功] 新單號: {first_line} | 狀態: {new_status}")
                 return
             else:
                 print(f"⚠️ [未符合新單據格式]: {first_line}")
 
+    except Exception as e:
+        print(f"❌ 處理訊息時發生重大錯誤: {e}")
+        traceback.print_exc()
+
 # ----------------------------------------------------
-# 🚀 Flask App 主實體 (相容主入口與外部匯入)
+# 🚀 Flask 主實體
 # ----------------------------------------------------
 app = Flask(__name__)
 app.register_blueprint(bot_bp)
@@ -580,7 +461,6 @@ app.register_blueprint(bot_bp)
 def index():
     return "Bot Listener is running!", 200
 
-# 初始化背景任務與 Google Sheet 快取
 init_bot_listener()
 
 if __name__ == "__main__":
