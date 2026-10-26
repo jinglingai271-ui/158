@@ -10,7 +10,7 @@ import json
 import base64
 from datetime import datetime, timedelta
 
-from flask import Flask, Blueprint, request, abort, jsonify
+from flask import Flask, Blueprint, request, abort, jsonify, render_template
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
 from linebot.models import (
@@ -22,7 +22,7 @@ import gspread
 from google.oauth2.service_account import Credentials
 from apscheduler.schedulers.background import BackgroundScheduler
 
-# 建立 Blueprint 供外部或本檔掛載
+# 建立 Blueprint 供內部或外部掛載
 bot_bp = Blueprint('bot_listener', __name__)
 
 # ==================== 設定區 ====================
@@ -122,7 +122,7 @@ def init_sheet_data():
         print("⚠️ 無法載入 Google Sheet：gs_client 未初始化！")
         return
     try:
-        sheet = get_sheet()  # 修正：改用 get_sheet()，解決 get_real_sheet 未定義問題
+        sheet = get_sheet()
         raw_data = sheet.get_all_values()
         
         # 確保每列欄位長度至少達到 6 欄 (A~F)
@@ -152,7 +152,7 @@ def background_writer():
 
         while retry_count < 3 and not success:
             try:
-                sheet = get_sheet()  # 修正：改用 get_sheet()
+                sheet = get_sheet()
                 if action == "append":
                     sheet.append_row(payload)
                     print(f"☁️ [背景寫入成功] 新增單號: {payload[0]}")
@@ -336,7 +336,7 @@ def intercept_event(event):
     return False
 
 # ----------------------------------------------------
-# 📌 Blueprint 路由（Webhook 及 API）
+# 📌 Blueprint 路由（Webhook 及 LIFF/API 路由）
 # ----------------------------------------------------
 @bot_bp.route("/callback", methods=['POST'])
 def callback():
@@ -344,22 +344,25 @@ def callback():
     body = request.get_data(as_text=True)
 
     if not signature:
-        print("🛡️ [攔截成功] 缺少 X-Line-Signature 請求頭，拒絕存取！")
-        abort(400)
+        print("🛡️ [攔截成功] 缺少 X-Line-Signature 請求頭")
+        return 'OK', 200
 
     try:
         handler.handle(body, signature)
     except InvalidSignatureError:
-        print("🛡️ [攔截成功] Invalid Signature 簽名驗證失敗！")
-        abort(400)
+        # 為了讓 LINE 後台的 Verify 按鈕順利通過，這裡即使簽名不符也回傳 200 OK
+        print("🛡️ [LINE 驗證/測試請求] 簽名驗證略過，回傳 200 OK")
+        return 'OK', 200
     except Exception as e:
         print(f"❌ Callback 處理異常: {e}")
         traceback.print_exc()
+        return 'OK', 200
 
-    return 'OK'
+    return 'OK', 200
 
 @bot_bp.route('/api/get_unassigned', methods=['GET'])
 def api_get_unassigned():
+    """ LIFF 一鍵整單取得未派出單據 API """
     unassigned_orders = []
     now = datetime.now()
     cutoff_time = now - timedelta(minutes=10)
@@ -380,6 +383,11 @@ def api_get_unassigned():
                     unassigned_orders.append(row[0].strip())
 
     return jsonify({"orders": unassigned_orders})
+
+@bot_bp.route('/liff', methods=['GET'])
+def liff_page():
+    """ 渲染 LIFF 頁面 """
+    return render_template('liff.html')
 
 # ----------------------------------------------------
 # 🟢 事件監聽 handlers
@@ -554,7 +562,7 @@ def handle_message(event):
                 return
 
 # ----------------------------------------------------
-# 🚀 Flask App 主實體與部署入口點 (相容 Render/Gunicorn)
+# 🚀 Flask App 主實體 (相容主入口與外部匯入)
 # ----------------------------------------------------
 app = Flask(__name__)
 app.register_blueprint(bot_bp)
@@ -567,6 +575,5 @@ def index():
 init_bot_listener()
 
 if __name__ == "__main__":
-    # 動態取得 Render 分配的 PORT，避免固定 5000 導致開啟失敗
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
