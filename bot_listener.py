@@ -5,6 +5,9 @@ import math
 import traceback
 import json
 import base64
+import queue
+import threading
+import time
 from datetime import datetime, timedelta
 
 from flask import Flask, Blueprint, request, abort, jsonify, render_template
@@ -84,15 +87,15 @@ handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
 sheet_data = [] 
 msg_id_to_row = {}
+write_queue = queue.Queue() # ⚡ 非同步寫入佇列，解決卡頓問題
+sheet_lock = threading.Lock()
 
 def get_sheet():
-    """ 取得主要 Google Sheet 工作表 """
     if not gs_client:
         raise Exception("Google Sheet 用戶端未正確認證！")
     return gs_client.open(SHEET_NAME).sheet1
 
 def init_sheet_data():
-    """ 啟動時完整同步 Google Sheet 至記憶體 """
     global sheet_data
     if not gs_client:
         print("⚠️ 無法載入 Google Sheet：gs_client 未初始化！")
@@ -106,10 +109,37 @@ def init_sheet_data():
             while len(row_copy) < 6:
                 row_copy.append("")
             formatted_data.append(row_copy)
-        sheet_data = formatted_data
+        with sheet_lock:
+            sheet_data = formatted_data
         print(f"⚡ [系統初始化] 成功載入 {len(sheet_data)} 列資料至記憶體！")
     except Exception as e:
         print("❌ 初始化 Google Sheet 失敗:", str(e))
+
+def background_writer():
+    """ 背景執行緒：依序安全寫入 Google Sheet，絕不卡住主線程 """
+    print("🚀 [背景寫入執行緒] 已啟動運行")
+    while True:
+        try:
+            task = write_queue.get()
+            if task is None:
+                break
+            
+            action, payload = task
+            sheet = get_sheet()
+            
+            if action == "append":
+                sheet.append_row(payload)
+                print(f"☁️ [背景寫入成功] 新增單號: {payload[0][:20]}...")
+            elif action == "update_cell":
+                row, col, value = payload
+                sheet.update_cell(row, col, value)
+                print(f"☁️ [背景寫入成功] 第 {row} 列 Col {col} -> {value}")
+            
+            write_queue.task_done()
+            time.sleep(1.0) # 控速保護，避免觸發 Google API 429 頻率限制
+        except Exception as e:
+            print(f"❌ [背景寫入異常]: {e}")
+            time.sleep(2.0)
 
 def parse_booking_time(text):
     now = datetime.now()
@@ -125,10 +155,8 @@ def parse_booking_time(text):
     return None
 
 def check_reservation_orders():
-    """ 定期輪詢預約單時間狀況並直接同步 Google Sheet """
     now = datetime.now()
-    try:
-        sheet = get_sheet()
+    with sheet_lock:
         for idx in range(1, len(sheet_data)):
             row = sheet_data[idx]
             sheet_row_num = idx + 1 
@@ -136,26 +164,28 @@ def check_reservation_orders():
                 booking_time_str = row[4]
                 if not booking_time_str:
                     continue
-                booking_dt = datetime.strptime(booking_time_str, "%Y-%m-%d %H:%M")
-                time_diff_minutes = (booking_dt - now).total_seconds() / 60.0
+                try:
+                    booking_dt = datetime.strptime(booking_time_str, "%Y-%m-%d %H:%M")
+                    time_diff_minutes = (booking_dt - now).total_seconds() / 60.0
 
-                if time_diff_minutes <= 15:
-                    if sheet_data[idx][1] != "未派出" or sheet_data[idx][5] != "即時":
-                        sheet_data[idx][1] = "未派出"
-                        sheet_data[idx][5] = "即時"
-                        sheet.update_cell(sheet_row_num, 2, "未派出")
-                        sheet.update_cell(sheet_row_num, 6, "即時")
-                        print(f"⏰ [預約單轉即時] 第 {sheet_row_num} 列升級為即時單")
-                elif time_diff_minutes <= 60:
-                    if sheet_data[idx][1] != "未派出":
-                        sheet_data[idx][1] = "未派出"
-                        sheet.update_cell(sheet_row_num, 2, "未派出")
-                        print(f"⏰ [預約單開放整單] 第 {sheet_row_num} 列進入整單流程")
-    except Exception as e:
-        print(f"❌ 輪詢預約單異常: {e}")
+                    if time_diff_minutes <= 15:
+                        if sheet_data[idx][1] != "未派出" or sheet_data[idx][5] != "即時":
+                            sheet_data[idx][1] = "未派出"
+                            sheet_data[idx][5] = "即時"
+                            write_queue.put(("update_cell", (sheet_row_num, 2, "未派出")))
+                            write_queue.put(("update_cell", (sheet_row_num, 6, "即時")))
+                    elif time_diff_minutes <= 60:
+                        if sheet_data[idx][1] != "未派出":
+                            sheet_data[idx][1] = "未派出"
+                            write_queue.put(("update_cell", (sheet_row_num, 2, "未派出")))
+                except Exception:
+                    pass
 
 def init_bot_listener():
     init_sheet_data()
+    # 啟動背景寫入執行緒
+    threading.Thread(target=background_writer, daemon=True).start()
+    # 啟動定時排程器
     try:
         scheduler = BackgroundScheduler()
         scheduler.add_job(func=check_reservation_orders, trigger="interval", seconds=60)
@@ -256,16 +286,12 @@ def callback():
     signature = request.headers.get('X-Line-Signature')
     body = request.get_data(as_text=True)
     
-    print("📡 [收到 HTTP POST /callback 請求]")
-
     if not signature:
-        print("⚠️ 缺少 X-Line-Signature 標頭")
         return 'OK', 200
 
     try:
         handler.handle(body, signature)
     except InvalidSignatureError:
-        print("⚠️ [LINE 簽名驗證跳過/測試請求]")
         return 'OK', 200
     except Exception as e:
         print(f"❌ Callback 處理異常: {e}")
@@ -279,18 +305,19 @@ def api_get_unassigned():
     unassigned_orders = []
     now = datetime.now()
     cutoff_time = now - timedelta(minutes=10)
-    for row in sheet_data[1:]:
-        if len(row) >= 2 and row[1] == "未派出":
-            order_time_str = row[4] if len(row) >= 5 else ""
-            if order_time_str:
-                try:
-                    order_dt = datetime.strptime(order_time_str, "%Y-%m-%d %H:%M")
-                    if cutoff_time <= order_dt <= now:
+    with sheet_lock:
+        for row in sheet_data[1:]:
+            if len(row) >= 2 and row[1] == "未派出":
+                order_time_str = row[4] if len(row) >= 5 else ""
+                if order_time_str:
+                    try:
+                        order_dt = datetime.strptime(order_time_str, "%Y-%m-%d %H:%M")
+                        if cutoff_time <= order_dt <= now:
+                            unassigned_orders.append(row[0].strip())
+                    except Exception:
                         unassigned_orders.append(row[0].strip())
-                except Exception:
+                else:
                     unassigned_orders.append(row[0].strip())
-            else:
-                unassigned_orders.append(row[0].strip())
     return jsonify({"orders": unassigned_orders})
 
 @bot_bp.route('/liff', methods=['GET'])
@@ -305,15 +332,12 @@ def handle_unsend(event):
     if intercept_event(event):
         return
     unsend_msg_id = event.unsend.message_id
-    target_row_idx = msg_id_to_row.get(unsend_msg_id)
-    if target_row_idx and target_row_idx <= len(sheet_data):
-        sheet_data[target_row_idx - 1][1] = "取消"
-        try:
-            sheet = get_sheet()
-            sheet.update_cell(target_row_idx, 2, "取消")
-            print(f"🚫 [收回取消成功] 第 {target_row_idx} 列已更新為：取消")
-        except Exception as e:
-            print(f"❌ 更新取消狀態失敗: {e}")
+    with sheet_lock:
+        target_row_idx = msg_id_to_row.get(unsend_msg_id)
+        if target_row_idx and target_row_idx <= len(sheet_data):
+            sheet_data[target_row_idx - 1][1] = "取消"
+            write_queue.put(("update_cell", (target_row_idx, 2, "取消")))
+            print(f"🚫 [收回取消成功] 第 {target_row_idx} 列已排入取消更新")
 
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
@@ -323,8 +347,6 @@ def handle_message(event):
     user_msg = event.message.text.strip()
     user_id = event.source.user_id
     msg_id = event.message.id
-
-    print(f"📩 [進入 handle_message 處理器]: {user_msg}")
 
     if user_msg.startswith("試算") or user_msg.startswith("車資"):
         match = re.search(r'(?:試算|車資)\s*([\d\.]+)\s*([\d\.]+)', user_msg)
@@ -372,9 +394,7 @@ def handle_message(event):
     has_mention = "@" in user_msg
     has_dispatch_kw = any(kw in user_msg for kw in ["噴", "出", "待出發", "走", "好", "可", "ok", "OK"])
 
-    try:
-        sheet = get_sheet()
-
+    with sheet_lock:
         # A. 群組 tag 核銷
         if has_mention and has_dispatch_kw:
             mentioned_names = re.findall(r'@([^\s]+)', user_msg)
@@ -390,9 +410,9 @@ def handle_message(event):
                     if matched:
                         sheet_data[idx - 1][1] = "已派出"
                         sheet_data[idx - 1][3] = f"核銷調度:{sender_name}"
-                        sheet.update_cell(idx, 2, "已派出")
-                        sheet.update_cell(idx, 4, f"核銷調度:{sender_name}")
-                        print(f"🚀 [調度核銷成功] 第 {idx} 列 -> 已派出")
+                        write_queue.put(("update_cell", (idx, 2, "已派出")))
+                        write_queue.put(("update_cell", (idx, 4, f"核銷調度:{sender_name}")))
+                        print(f"🚀 [調度核銷排入佇列] 第 {idx} 列 -> 已派出")
                         return
 
         first_line = user_msg.split('\n')[0].strip()
@@ -428,15 +448,15 @@ def handle_message(event):
                 else:
                     new_c_content = formatted_report
                 sheet_data[same_order_same_addr_idx - 1][2] = new_c_content
-                sheet.update_cell(same_order_same_addr_idx, 3, new_c_content)
-                print(f"📝 [司機回報成功] 第 {same_order_same_addr_idx} 列更新")
+                write_queue.put(("update_cell", (same_order_same_addr_idx, 3, new_c_content)))
+                print(f"📝 [司機回報排入佇列] 第 {same_order_same_addr_idx} 列更新")
                 return
 
         # C. 新增單據
         else:
             if is_new_order_format(user_msg):
                 booking_time = parse_booking_time(user_msg)
-                new_status = "預預約等待中" if booking_time else "未派出"
+                new_status = "預約等待中" if booking_time else "未派出"
                 new_type = "預約單" if booking_time else "即時"
 
                 new_row = [
@@ -448,19 +468,16 @@ def handle_message(event):
                     new_type
                 ]
                 
-                sheet.append_row(new_row)
+                # ⚡ 瞬間寫入記憶體快取並推入背景佇列，零等待！
                 sheet_data.append(new_row)
                 target_row = len(sheet_data)
                 msg_id_to_row[msg_id] = target_row
+                write_queue.put(("append", new_row))
                 
-                print(f"🎉 [Google Sheet 寫入成功] 新單號: {first_line} | 狀態: {new_status}")
+                print(f"⚡ [高速排入佇列] 新單號: {first_line} | 狀態: {new_status}")
                 return
             else:
                 print(f"⚠️ [未符合新單據格式]: {first_line}")
-
-    except Exception as e:
-        print(f"❌ 處理訊息時發生重大錯誤: {e}")
-        traceback.print_exc()
 
 # ----------------------------------------------------
 # 🚀 Flask 主實體
@@ -472,7 +489,7 @@ app.register_blueprint(bot_bp)
 def index():
     return "Bot Listener is running!", 200
 
-# 啟動時自動載入快取與排程器
+# 啟動時自動載入快取與非同步背景佇列
 init_bot_listener()
 
 if __name__ == "__main__":
